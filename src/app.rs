@@ -9,6 +9,8 @@ use std::thread;
 /// Results coming back from background `aws` calls.
 pub enum Msg {
     Children(Vec<usize>, Result<Vec<Node>>),
+    /// Credential check for the named profile.
+    Auth(String, Result<()>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +50,8 @@ pub struct App {
     pub command_input: Option<String>,
     /// Command to execute in the real terminal; consumed by the main loop.
     pub pending_run: Option<String>,
+    /// The pending/running command is a login; load the tree once it succeeds.
+    pub pending_login: bool,
     pub status: String,
     pub should_quit: bool,
     /// Printed to stdout after the terminal is restored.
@@ -58,12 +62,14 @@ pub struct App {
 }
 
 impl App {
+    const HELP: &str = "↑↓/jk move  Tab expand/collapse  ←→/hl switch panel  Enter run  y copy  e edit  r region  L login  p profile  q quit";
+
     pub fn new(config: Config, profile: Option<String>, region: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut profiles = aws::load_profiles();
         if let Some(p) = &profile {
             if !profiles.iter().any(|x| &x.name == p) {
-                profiles.insert(0, Profile { name: p.clone(), region: None });
+                profiles.insert(0, Profile { name: p.clone(), region: None, login: None });
             }
         }
         let mut app = App {
@@ -81,6 +87,7 @@ impl App {
             region_input: None,
             command_input: None,
             pending_run: None,
+            pending_login: false,
             status: String::new(),
             should_quit: false,
             output_on_exit: None,
@@ -104,7 +111,7 @@ impl App {
         app.ecs = Some(Ecs { profile: "acme-prod".into(), region: region.clone() });
         app.tree = Tree::new(region);
         app.screen = Screen::Explorer;
-        app.status = "↑↓/jk move  Tab expand/collapse  ←→/hl switch panel  Enter run  y copy  e edit  r region  p profile  q quit".into();
+        app.status = Self::HELP.into();
 
         let cluster = |name: &str| Cluster {
             arn: format!("arn:aws:ecs:eu-west-1:123456789012:cluster/{name}"),
@@ -189,7 +196,55 @@ impl App {
         self.selected = 1; // the ECS row
         self.commands.clear();
         self.screen = Screen::Explorer;
-        self.status = "↑↓/jk move  Tab expand/collapse  ←→/hl switch panel  Enter run  y copy  e edit  r region  p profile  q quit".into();
+        self.refresh_rows();
+        self.check_credentials();
+    }
+
+    /// Verifies the profile's credentials in the background before loading,
+    /// so an expired session can trigger its login command first.
+    fn check_credentials(&mut self) {
+        let Some(ecs) = self.ecs.clone() else { return };
+        self.status = format!("Checking credentials for {}…", ecs.profile);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let res = ecs.check_credentials();
+            let _ = tx.send(Msg::Auth(ecs.profile, res));
+        });
+    }
+
+    fn current_login(&self) -> Option<aws::Login> {
+        let ecs = self.ecs.as_ref()?;
+        self.profiles.iter().find(|p| p.name == ecs.profile)?.login
+    }
+
+    /// Runs the profile's login command (`aws sso login` / `aws login`).
+    pub fn login(&mut self) {
+        let Some(ecs) = &self.ecs else { return };
+        match self.current_login() {
+            Some(l) => {
+                self.pending_run = Some(l.command(&ecs.profile));
+                self.pending_login = true;
+            }
+            None => self.status = format!("Profile {} has no sso_session or login_session to log in with", ecs.profile),
+        }
+    }
+
+    /// Called by the main loop after `pending_run` has finished.
+    pub fn command_finished(&mut self, success: bool) {
+        if std::mem::take(&mut self.pending_login) {
+            if success {
+                self.status = Self::HELP.into();
+                self.reload_root();
+            } else {
+                self.status = "Login failed. Press L to try again.".into();
+            }
+        }
+    }
+
+    fn reload_root(&mut self) {
+        if let Some(n) = self.tree.get_mut(&[0]) {
+            n.children = None;
+        }
         self.load_children(vec![0]);
         self.refresh_rows();
     }
@@ -254,6 +309,23 @@ impl App {
                         }
                     }
                     self.refresh_rows();
+                }
+                Msg::Auth(profile, res) => {
+                    // Ignore results for a profile the user has since left.
+                    if self.ecs.as_ref().map(|e| e.profile != profile).unwrap_or(true) {
+                        continue;
+                    }
+                    match res {
+                        Ok(()) => {
+                            self.status = Self::HELP.into();
+                            self.reload_root();
+                        }
+                        Err(_) if self.current_login().is_some() => self.login(),
+                        Err(e) => {
+                            self.status = format!("Credentials for {profile} failed: {e:#}");
+                            self.reload_root();
+                        }
+                    }
                 }
             }
         }

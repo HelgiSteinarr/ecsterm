@@ -11,6 +11,25 @@ use std::process::Command;
 pub struct Profile {
     pub name: String,
     pub region: Option<String>,
+    pub login: Option<Login>,
+}
+
+/// How a profile signs in, taken from its keys in ~/.aws/config.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Login {
+    /// `sso_session` or legacy `sso_start_url`: IAM Identity Center.
+    Sso,
+    /// `login_session`: console credentials from `aws login`.
+    Console,
+}
+
+impl Login {
+    pub fn command(self, profile: &str) -> String {
+        match self {
+            Login::Sso => format!("aws sso login --profile {profile}"),
+            Login::Console => format!("aws login --profile {profile}"),
+        }
+    }
 }
 
 fn aws_dir() -> Option<PathBuf> {
@@ -25,13 +44,16 @@ pub fn load_profiles() -> Vec<Profile> {
 fn load_profiles_from(dir: &std::path::Path) -> Vec<Profile> {
     let mut profiles: Vec<Profile> = Vec::new();
 
-    let mut push = |name: &str, region: Option<String>| {
+    let mut push = |name: &str, region: Option<String>, login: Option<Login>| {
         if let Some(p) = profiles.iter_mut().find(|p| p.name == name) {
             if p.region.is_none() {
                 p.region = region;
             }
+            if p.login.is_none() {
+                p.login = login;
+            }
         } else {
-            profiles.push(Profile { name: name.to_string(), region });
+            profiles.push(Profile { name: name.to_string(), region, login });
         }
     };
 
@@ -39,9 +61,10 @@ fn load_profiles_from(dir: &std::path::Path) -> Vec<Profile> {
         let Ok(text) = std::fs::read_to_string(dir.join(file)) else { continue };
         let mut current: Option<String> = None;
         let mut region: Option<String> = None;
-        let mut flush = |current: &mut Option<String>, region: &mut Option<String>| {
+        let mut login: Option<Login> = None;
+        let mut flush = |current: &mut Option<String>, region: &mut Option<String>, login: &mut Option<Login>| {
             if let Some(name) = current.take() {
-                push(&name, region.take());
+                push(&name, region.take(), login.take());
             }
         };
         for line in text.lines() {
@@ -50,7 +73,10 @@ fn load_profiles_from(dir: &std::path::Path) -> Vec<Profile> {
                 continue;
             }
             if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                flush(&mut current, &mut region);
+                flush(&mut current, &mut region, &mut login);
+                // Keys under a skipped section must not leak into the next profile.
+                region = None;
+                login = None;
                 let header = header.trim();
                 let name = if prefixed {
                     match header.strip_prefix("profile ") {
@@ -64,12 +90,15 @@ fn load_profiles_from(dir: &std::path::Path) -> Vec<Profile> {
                 };
                 current = Some(name.to_string());
             } else if let Some((k, v)) = line.split_once('=') {
-                if k.trim() == "region" {
-                    region = Some(v.trim().to_string());
+                match k.trim() {
+                    "region" => region = Some(v.trim().to_string()),
+                    "sso_session" | "sso_start_url" if prefixed => login = Some(Login::Sso),
+                    "login_session" if prefixed => login = Some(Login::Console),
+                    _ => {}
                 }
             }
         }
-        flush(&mut current, &mut region);
+        flush(&mut current, &mut region, &mut login);
     }
 
     profiles.sort_by(|a, b| (a.name != "default").cmp(&(b.name != "default")).then(a.name.cmp(&b.name)));
@@ -130,6 +159,19 @@ fn s(v: &Value, key: &str) -> String {
 impl Ecs {
     pub fn prefix(&self) -> String {
         format!("--profile {} --region {}", self.profile, self.region)
+    }
+
+    /// Cheap call that fails when the profile has no usable credentials,
+    /// e.g. an expired SSO token.
+    pub fn check_credentials(&self) -> Result<()> {
+        let out = Command::new("aws")
+            .args(["--profile", &self.profile, "--region", &self.region, "sts", "get-caller-identity"])
+            .output()
+            .context("failed to launch `aws` CLI; is it installed and on PATH?")?;
+        if !out.status.success() {
+            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
     }
 
     fn run(&self, args: &[&str]) -> Result<Value> {
@@ -258,7 +300,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".aws")).unwrap();
         std::fs::write(
             dir.join(".aws/config"),
-            "[default]\nregion = eu-west-1\n\n[profile prod]\nregion=eu-north-1\nsso_session = corp\n\n[sso-session corp]\nsso_region = us-east-1\n",
+            "[default]\nregion = eu-west-1\nlogin_session = arn:aws:sts::1:assumed-role/x/y\n\n[profile prod]\nregion=eu-north-1\nsso_session = corp\n\n[sso-session corp]\nsso_region = us-east-1\nsso_start_url = https://x\n\n[profile plain]\nregion = eu-west-2\n",
         )
         .unwrap();
         std::fs::write(dir.join(".aws/credentials"), "[prod]\naws_access_key_id = x\n[legacy]\naws_access_key_id = y\n").unwrap();
@@ -266,9 +308,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["default", "legacy", "prod"]);
-        assert_eq!(profiles[2].region.as_deref(), Some("eu-north-1"));
+        assert_eq!(names, vec!["default", "legacy", "plain", "prod"]);
+        assert_eq!(profiles[3].region.as_deref(), Some("eu-north-1"));
         assert_eq!(profiles[1].region, None);
+        assert_eq!(profiles[0].login, Some(Login::Console));
+        assert_eq!(profiles[1].login, None);
+        assert_eq!(profiles[2].login, None);
+        assert_eq!(profiles[3].login, Some(Login::Sso));
     }
 
     #[test]

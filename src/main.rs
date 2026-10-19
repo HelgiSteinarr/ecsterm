@@ -83,14 +83,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             terminal.show_cursor()?;
             ratatui::restore();
             crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
-            let status = run_in_terminal(&cmd);
+            // A successful login returns straight to the TUI; anything else
+            // waits so its output can be read.
+            let status = run_in_terminal(&cmd, !app.pending_login);
             *terminal = ratatui::init();
             terminal.clear()?;
-            app.status = match status {
+            app.status = match &status {
                 Ok(s) if s.success() => "Command finished.".into(),
                 Ok(s) => format!("Command exited with {}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
                 Err(e) => format!("Failed to run command: {e}"),
             };
+            app.command_finished(matches!(status, Ok(s) if s.success()));
             continue;
         }
         terminal.draw(|f| ui::draw(f, app))?;
@@ -117,13 +120,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 /// Runs `cmd` through the user's shell with the real terminal attached, then
-/// waits for Enter so non-interactive output stays readable.
+/// waits for Enter so non-interactive output stays readable. On success the
+/// pause is skipped unless `pause_on_success` is set.
 ///
 /// The child gets freshly opened `/dev/tty` descriptors instead of inheriting
 /// our stdin/stdout. Interactive tools such as session-manager-plugin read the
 /// tty directly and fail with "read /dev/stdin: input/output error" when the
 /// inherited descriptor has been used by the TUI's event reader.
-fn run_in_terminal(cmd: &str) -> Result<std::process::ExitStatus> {
+fn run_in_terminal(cmd: &str, pause_on_success: bool) -> Result<std::process::ExitStatus> {
     use std::fs::OpenOptions;
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
@@ -140,6 +144,9 @@ fn run_in_terminal(cmd: &str) -> Result<std::process::ExitStatus> {
         child.stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e));
     }
     let status = child.status()?;
+    if status.success() && !pause_on_success {
+        return Ok(status);
+    }
     print!("\n\x1b[2m[exit {}] Press Enter to return to ecsterm…\x1b[0m ", status.code().unwrap_or(-1));
     std::io::stdout().flush()?;
     let mut line = String::new();
@@ -201,6 +208,7 @@ fn handle_explorer(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('p') => app.screen = Screen::Profiles,
+        KeyCode::Char('L') => app.login(),
         KeyCode::Char('r') => app.region_input = Some(app.ecs.as_ref().map(|e| e.region.clone()).unwrap_or_default()),
         KeyCode::Char('R') | KeyCode::F(5) => app.reload_selected(),
         // h/l and arrows switch between the tree and the command panel.

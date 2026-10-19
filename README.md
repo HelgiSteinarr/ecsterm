@@ -38,6 +38,8 @@ Binaries are on the [releases page](https://github.com/aronjohanns/ecsterm/relea
 ecsterm [--profile NAME] [--region REGION] [--config PATH]
 ```
 
+When a profile is opened, its credentials are checked first. If they have expired, ecsterm runs the login from the profile: `aws sso login` for profiles with `sso_session`/`sso_start_url`, `aws login` for profiles with `login_session`. Press `L` to log in again at any time.
+
 ## Config
 
 Linux/macOS: `~/.config/ecsterm/config.toml` (or `$XDG_CONFIG_HOME`). Windows: `%APPDATA%\ecsterm\config.toml`.
